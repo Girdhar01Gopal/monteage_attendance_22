@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/status.dart' as ws_status;
@@ -51,7 +52,6 @@ class WebSocketService {
 
       _subscription = _channel!.stream.listen(
             (data) {
-          // Log every single byte/message from server
           if (data is String) {
             print('📨 WS TEXT from server: $data');
           } else if (data is List<int>) {
@@ -82,16 +82,18 @@ class WebSocketService {
     }
   }
 
-  // ── Send Binary (JPEG bytes) ───────────────────────────────────────────────
+  // ── Send Binary as Base64 string ───────────────────────────────────────────
+  // Server base64-encoded string expect karta hai, raw bytes nahi
   bool sendBinaryFrame(Uint8List jpegBytes) {
     if (_state != WsState.connected || _channel == null) {
       return false;
     }
     try {
-      _channel!.sink.add(jpegBytes);
+      final String base64Frame = base64Encode(jpegBytes);
+      _channel!.sink.add(base64Frame);
       return true;
     } catch (e) {
-      print('❌ WS SEND BINARY ERROR: $e');
+      print('❌ WS SEND BASE64 ERROR: $e');
       _handleError('Send failed: $e');
       return false;
     }
@@ -155,7 +157,6 @@ class WebSocketService {
 
     _reconnectTimer?.cancel();
     _reconnectAttempts++;
-    // Exponential backoff: 2s, 4s, 6s ... max 20s
     final delaySec = (_reconnectAttempts * 2).clamp(2, 20);
     final delay = Duration(seconds: delaySec);
 
