@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:image/image.dart' as img;
 import 'package:intl/intl.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -21,41 +22,31 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
-  // ── Camera ──────────────────────────────────────────────────────────────────
   CameraController? _camCtrl;
   bool _isInitializingCamera = false;
   bool _isCamReady = false;
   bool _camPermitted = false;
 
-  // ── WebSocket ────────────────────────────────────────────────────────────────
   final WebSocketService _ws = WebSocketService();
   WsState _wsState = WsState.disconnected;
   String _wsStatusText = 'Disconnected';
   Color _wsStatusColor = Colors.red;
 
-  // ── Frame streaming ──────────────────────────────────────────────────────────
   int _framesSent = 0;
   bool _isStreaming = false;
   DateTime? _lastFrameTime;
+  bool _isSendingFrame = false;
 
-  // ── Attendance processing ────────────────────────────────────────────────────
   bool _isProcessing = false;
   Timer? _resetTimer;
 
-  // ── Check-In / Check-Out toggle ──────────────────────────────────────────────
-  // Tracks whether the last action was check-in or check-out PER employee.
-  // Key = employeeName (lowercased), Value = 'checkin' | 'checkout'
   final Map<String, String> _lastAction = {};
-
-  // ── Last server message (shown on screen for debug) ──────────────────────────
   String _lastServerMsg = '';
 
-  // ── Clock ────────────────────────────────────────────────────────────────────
   Timer? _clockTimer;
   String _currentTime = '';
   String _currentDate = '';
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   @override
   void initState() {
     super.initState();
@@ -87,13 +78,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // CLOCK
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ── Clock ──────────────────────────────────────────────────────────────────
   void _startClock() {
     _updateClock();
-    _clockTimer =
-        Timer.periodic(const Duration(seconds: 1), (_) => _updateClock());
+    _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) => _updateClock());
   }
 
   void _updateClock() {
@@ -106,14 +94,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // MODE — determined by last action per employee, not by clock time
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  /// Returns the NEXT action for this employee:
-  /// - If they haven't done anything yet → 'checkin'
-  /// - If last action was 'checkin'      → 'checkout'
-  /// - If last action was 'checkout'     → 'checkin'  (next day / re-entry)
   String _nextActionFor(String employeeName) {
     final key = employeeName.toLowerCase().trim();
     final last = _lastAction[key];
@@ -121,12 +101,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return 'checkout';
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // CAMERA
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ── Camera ─────────────────────────────────────────────────────────────────
   Future<void> _initCamera() async {
     if (_isInitializingCamera) return;
     _isInitializingCamera = true;
+
     final status = await Permission.camera.request();
     if (!status.isGranted) {
       if (mounted) setState(() => _camPermitted = false);
@@ -144,23 +123,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     }
 
-    final CameraController newController = CameraController(
+    final newController = CameraController(
       cam,
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.jpeg,
+      imageFormatGroup: ImageFormatGroup.yuv420,
     );
 
     try {
       await newController.initialize();
-
-      // If widget is no longer mounted, dispose the newly initialized controller.
       if (!mounted) {
         await newController.dispose();
         return;
       }
 
-      // Dispose the old controller (if any) and assign the new one.
       final old = _camCtrl;
       if (old != null) {
         try {
@@ -168,6 +144,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         } catch (_) {}
       }
       _camCtrl = newController;
+
       if (mounted) {
         setState(() => _isCamReady = true);
         if (_wsState == WsState.connected) _startStreaming();
@@ -182,9 +159,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // WEBSOCKET
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ── WebSocket ──────────────────────────────────────────────────────────────
   void _initWebSocket() {
     _ws.onStateChange = (state) {
       if (!mounted) return;
@@ -198,7 +173,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           case WsState.connected:
             _wsStatusText = 'Connected';
             _wsStatusColor = Colors.greenAccent;
-            // Resume streaming only if not in the middle of processing
             if (_isCamReady && !_isProcessing) _startStreaming();
             break;
           case WsState.disconnected:
@@ -216,21 +190,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     };
 
     _ws.onMessage = (dynamic msg) {
-      debugPrint('SERVER RESPONSE: $msg');
-
+      debugPrint('SERVER RAW: $msg');
       if (msg is! String) return;
-
       if (mounted) setState(() => _lastServerMsg = msg);
 
       Map<String, dynamic> data;
       try {
         data = jsonDecode(msg) as Map<String, dynamic>;
       } catch (_) {
-        debugPrint('Non-JSON message from server: $msg');
+        debugPrint('Non-JSON: $msg');
         return;
       }
 
-      final String employeeName = (data['name'] ??
+      // ✅ FIX: full_name sabse pehle check karo (server yahi bhejta hai)
+      final String employeeName = (data['full_name'] ??
+          data['name'] ??
           data['employee'] ??
           data['employee_name'] ??
           data['user'] ??
@@ -238,7 +212,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           .toString()
           .trim();
 
-      final String status = (data['status'] ??
+      // ✅ FIX: action sabse pehle check karo (server yahi bhejta hai)
+      final String status = (data['action'] ??
+          data['status'] ??
           data['event'] ??
           data['result'] ??
           '')
@@ -246,62 +222,70 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           .toLowerCase()
           .trim();
 
-      debugPrint('Parsed — name: "$employeeName" status: "$status"');
+      debugPrint('Parsed — name: "$employeeName"  status: "$status"');
 
-      // ── Ignore "no face" / "unknown" responses ─────────────────────────────
+      // No face / unknown ignore karo
       final bool isNoFace = status.contains('no_face') ||
           status.contains('unknown') ||
           status.contains('not_found') ||
-          status.contains('unrecognized');
+          status.contains('unrecognized') ||
+          status.isEmpty;
 
-      if (isNoFace) {
-        debugPrint('👤 SERVER: No face / unknown — continuing stream');
+      if (isNoFace && employeeName.isEmpty) {
+        debugPrint('👤 No face / unknown — continuing stream');
         return;
       }
 
-      // ── Trigger attendance if face was recognized ──────────────────────────
-      final bool isRecognized = status.contains('recogni') ||
-          status.contains('success') ||
-          status.contains('checkin') ||
+      // Face recognized
+      final bool isRecognized = status.contains('checkin') ||
           status.contains('checkout') ||
+          status.contains('checked_in') ||
+          status.contains('checked_out') ||
+          status.contains('recogni') ||
+          status.contains('success') ||
           status.contains('identif') ||
           status.contains('match') ||
           employeeName.isNotEmpty;
 
       if (isRecognized) {
-        debugPrint('🎯 SERVER: Face recognized → employee: "$employeeName"');
-        _onFaceRecognized(employeeName.isNotEmpty ? employeeName : 'Employee');
-      } else {
-        debugPrint('❓ SERVER: Unhandled response — name: "$employeeName" status: "$status"');
+        debugPrint('🎯 Face recognized → "$employeeName"  action: "$status"');
+
+        // ✅ Server jo action bheje wahi use karo (checkin/checkout)
+        final String serverAction = status.contains('checked_out') || status.contains('checkout')
+            ? 'checkout'
+            : 'checkin';
+
+        _onFaceRecognized(
+          employeeName.isNotEmpty ? employeeName : 'Employee',
+          serverAction: serverAction,
+        );
       }
     };
 
     _ws.onError = (err) => debugPrint('WS error: $err');
-
     _ws.connect();
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // FRAME STREAMING
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ── Frame Streaming ────────────────────────────────────────────────────────
   void _startStreaming() {
     if (_isStreaming) return;
     if (!_isCamReady || _camCtrl == null) return;
     if (_wsState != WsState.connected) return;
     if (_isProcessing) return;
 
-    debugPrint('📹 STREAM: Starting image stream');
+    debugPrint('📹 STREAM: Starting');
     setState(() {
       _isStreaming = true;
       _framesSent = 0;
     });
     _lastFrameTime = null;
+    _isSendingFrame = false;
     _camCtrl!.startImageStream(_onCameraFrame);
   }
 
   Future<void> _stopStreaming() async {
     if (!_isStreaming) return;
-    debugPrint('🛑 STREAM: Stopping image stream');
+    debugPrint('🛑 STREAM: Stopping');
     if (mounted) setState(() => _isStreaming = false);
     try {
       if (_camCtrl != null && _camCtrl!.value.isStreamingImages) {
@@ -312,6 +296,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _onCameraFrame(CameraImage image) {
     if (_isProcessing || _wsState != WsState.connected) return;
+    if (_isSendingFrame) return;
 
     final now = DateTime.now();
     if (_lastFrameTime != null &&
@@ -319,30 +304,87 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
     _lastFrameTime = now;
+    _isSendingFrame = true;
 
-    if (image.format.group != ImageFormatGroup.jpeg) {
-      debugPrint('⚠️ STREAM: Non-JPEG frame format: ${image.format.group} — skipping');
-      return;
-    }
-    final bytes = Uint8List.fromList(image.planes[0].bytes);
-    debugPrint('📤 STREAM: Sending frame ${_framesSent + 1} — ${bytes.length} bytes');
-    final sent = _ws.sendBinaryFrame(bytes);
-    if (sent && mounted) setState(() => _framesSent++);
+    _convertAndSend(image).whenComplete(() => _isSendingFrame = false);
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // ATTENDANCE — toggle checkin ↔ checkout per employee
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Future<void> _onFaceRecognized(String employeeName) async {
+  Future<void> _convertAndSend(CameraImage image) async {
+    try {
+      final Uint8List jpegBytes = await _yuvToJpeg(image);
+      if (jpegBytes.isEmpty) return;
+
+      debugPrint('📤 Frame ${_framesSent + 1} — ${jpegBytes.length} bytes');
+      final sent = _ws.sendBinaryFrame(jpegBytes);
+      if (sent && mounted) setState(() => _framesSent++);
+    } catch (e) {
+      debugPrint('❌ Frame convert error: $e');
+    }
+  }
+
+  Future<Uint8List> _yuvToJpeg(CameraImage image) async {
+    try {
+      final int width = image.width;
+      final int height = image.height;
+
+      final yPlane = image.planes[0];
+      final uPlane = image.planes[1];
+      final vPlane = image.planes[2];
+
+      final Uint8List yBytes = yPlane.bytes;
+      final Uint8List uBytes = uPlane.bytes;
+      final Uint8List vBytes = vPlane.bytes;
+
+      final int uvRowStride = uPlane.bytesPerRow;
+      final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
+
+      final imgLib = img.Image(width: width, height: height);
+
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final int yIndex = y * yPlane.bytesPerRow + x;
+          final int uvIndex =
+              (y >> 1) * uvRowStride + (x >> 1) * uvPixelStride;
+
+          if (yIndex >= yBytes.length ||
+              uvIndex >= uBytes.length ||
+              uvIndex >= vBytes.length) continue;
+
+          final int yVal = yBytes[yIndex] & 0xFF;
+          final int uVal = uBytes[uvIndex] & 0xFF;
+          final int vVal = vBytes[uvIndex] & 0xFF;
+
+          int r = (yVal + 1.402 * (vVal - 128)).round().clamp(0, 255);
+          int g = (yVal - 0.344136 * (uVal - 128) - 0.714136 * (vVal - 128))
+              .round()
+              .clamp(0, 255);
+          int b = (yVal + 1.772 * (uVal - 128)).round().clamp(0, 255);
+
+          imgLib.setPixelRgb(x, y, r, g, b);
+        }
+      }
+
+      final jpeg = img.encodeJpg(imgLib, quality: 60);
+      return Uint8List.fromList(jpeg);
+    } catch (e) {
+      debugPrint('YUV→JPEG error: $e');
+      return Uint8List(0);
+    }
+  }
+
+  // ── Attendance ─────────────────────────────────────────────────────────────
+  // ✅ FIX: serverAction parameter add kiya — server jo bheje wahi use karo
+  Future<void> _onFaceRecognized(String employeeName, {String? serverAction}) async {
     if (_isProcessing) return;
     if (!_isCamReady || _camCtrl == null) return;
 
     setState(() => _isProcessing = true);
     await _stopStreaming();
+    await Future.delayed(const Duration(milliseconds: 300));
 
-    // ── Decide action: first time → checkin, then toggle ──────────────────────
-    final action = _nextActionFor(employeeName);
-    final isCheckIn = action == 'checkin';
+    // Server ne action bheja to wahi use karo, warna toggle logic
+    final action = serverAction ?? _nextActionFor(employeeName);
+    final isCheckIn = action == 'checkin' || action == 'checked_in';
     final label = isCheckIn ? 'Check-In' : 'Check-Out';
     final Color snackColor =
     isCheckIn ? const Color(0xFF00C853) : const Color(0xFFFF6D00);
@@ -355,24 +397,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final timeStr = DateFormat('hh:mm a').format(now);
       final dateStr = DateFormat('dd MMM yyyy').format(now);
 
-      // Save photo locally
       final dir = await getApplicationDocumentsDirectory();
       final fileName = '${action}_${now.millisecondsSinceEpoch}.jpg';
       final savedPath = p.join(dir.path, fileName);
       await File(photo.path).copy(savedPath);
       await File(photo.path).delete();
-      debugPrint('📸 ATTENDANCE: Photo saved → $savedPath');
+      debugPrint('📸 Photo saved → $savedPath');
 
-      // ── Mark this action for the employee so next scan toggles ──────────────
       _lastAction[employeeName.toLowerCase().trim()] = action;
 
-      // Notify server
       _ws.sendText(jsonEncode({
         'event': action,
         'employee': employeeName,
         'timestamp': now.toIso8601String(),
       }));
-      debugPrint('📡 ATTENDANCE: Notified server — $action for $employeeName at ${now.toIso8601String()}');
 
       _showSnack(
         icon: isCheckIn ? '✅' : '👋',
@@ -380,24 +418,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         subtitle: '$employeeName — $timeStr, $dateStr',
         color: snackColor,
       );
-      debugPrint('✅ ATTENDANCE: Snackbar shown for $employeeName ($label)');
 
-      // Wait 2.5 s → resume for next employee
       _resetTimer?.cancel();
       _resetTimer = Timer(const Duration(milliseconds: 2500), () {
         if (mounted) {
           setState(() => _isProcessing = false);
-          debugPrint('▶️ ATTENDANCE: Processing done — resuming stream');
-          // Only restart streaming if WS is still connected
           if (_wsState == WsState.connected) _startStreaming();
         }
       });
     } catch (e) {
-      debugPrint('❌ ATTENDANCE ERROR: $e');
+      debugPrint('❌ Attendance error: $e');
       _showSnack(
         icon: '❌',
         title: 'Error',
-        subtitle: 'Could not record attendance: $e',
+        subtitle: 'Could not record: $e',
         color: Colors.red,
       );
       setState(() => _isProcessing = false);
@@ -430,37 +464,33 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               BoxShadow(color: color.withOpacity(0.25), blurRadius: 20)
             ],
           ),
-          child: Row(
-            children: [
-              Text(icon, style: const TextStyle(fontSize: 26)),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(title,
-                        style: TextStyle(
-                            color: color,
-                            fontSize: 14,
-                            fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 2),
-                    Text(subtitle,
-                        style: const TextStyle(
-                            color: Colors.white70, fontSize: 12)),
-                  ],
-                ),
+          child: Row(children: [
+            Text(icon, style: const TextStyle(fontSize: 26)),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(title,
+                      style: TextStyle(
+                          color: color,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 2),
+                  Text(subtitle,
+                      style: const TextStyle(
+                          color: Colors.white70, fontSize: 12)),
+                ],
               ),
-            ],
-          ),
+            ),
+          ]),
         ),
       ),
     );
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // BUILD
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ── Build ──────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -546,8 +576,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 fontSize: 11,
                 fontWeight: FontWeight.w500)),
         const Spacer(),
-      
-        if (!_isStreaming && _wsState == WsState.disconnected)
+        Text('Frames: $_framesSent',
+            style:
+            const TextStyle(color: Colors.white24, fontSize: 10)),
+        const SizedBox(width: 12),
+        if (_wsState == WsState.disconnected || _wsState == WsState.error)
           GestureDetector(
             onTap: _ws.connect,
             child: const Text('Retry ↺',
@@ -571,12 +604,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Stack(fit: StackFit.expand, children: [
       CameraPreview(_camCtrl!),
 
-      // Top gradient
       Positioned(
-        top: 0,
-        left: 0,
-        right: 0,
-        height: 90,
+        top: 0, left: 0, right: 0, height: 90,
         child: Container(
           decoration: BoxDecoration(
             gradient: LinearGradient(
@@ -591,12 +620,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ),
 
-      // Bottom gradient
       Positioned(
-        bottom: 0,
-        left: 0,
-        right: 0,
-        height: 80,
+        bottom: 0, left: 0, right: 0, height: 80,
         child: Container(
           decoration: BoxDecoration(
             gradient: LinearGradient(
@@ -611,7 +636,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ),
 
-      // Oval guide
       Center(
         child: Container(
           width: 230,
@@ -623,7 +647,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ),
 
-      // Pulse ring (streaming)
       if (_isStreaming && !_isProcessing)
         Center(
           child: Container(
@@ -637,7 +660,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
         ),
 
-      // Processing ring + spinner
       if (_isProcessing) ...[
         Center(
           child: Container(
@@ -660,11 +682,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ],
 
-      // Instruction label
       Positioned(
-        top: 18,
-        left: 16,
-        right: 16,
+        top: 18, left: 16, right: 16,
         child: Center(
           child: Container(
             padding:
@@ -686,12 +705,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ),
 
-      // Debug: last server message
       if (_lastServerMsg.isNotEmpty)
         Positioned(
-          bottom: 12,
-          left: 16,
-          right: 16,
+          bottom: 12, left: 16, right: 16,
           child: Center(
             child: Container(
               padding:
@@ -703,8 +719,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               child: Text(
                 'Server: $_lastServerMsg',
                 style: TextStyle(
-                    color: Colors.white.withOpacity(0.55), fontSize: 10),
-                maxLines: 1,
+                    color: Colors.white.withOpacity(0.55),
+                    fontSize: 10),
+                maxLines: 2,
                 overflow: TextOverflow.ellipsis,
               ),
             ),
@@ -744,8 +761,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF1565C0),
               foregroundColor: Colors.white,
-              padding:
-              const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 24, vertical: 14),
               shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(14)),
             ),
@@ -757,22 +774,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Widget _buildLoadingView() {
     return const Center(
-      child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-        CircularProgressIndicator(
-            color: Color(0xFF1E88E5), strokeWidth: 2.5),
-        SizedBox(height: 16),
-        Text('Initializing camera...',
-            style: TextStyle(color: Colors.white54, fontSize: 13)),
-      ]),
+      child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircularProgressIndicator(
+                color: Color(0xFF1E88E5), strokeWidth: 2.5),
+            SizedBox(height: 16),
+            Text('Initializing camera...',
+                style:
+                TextStyle(color: Colors.white54, fontSize: 13)),
+          ]),
     );
   }
 
-  // ── Bottom Panel ─────────────────────────────────────────────────────────────
   Widget _buildBottomPanel() {
-    // Show what the NEXT action will be for a generic scan
-    // (before we know the employee name, we show a neutral state)
     const Color modeColor = Color(0xFF42A5F5);
-
     return Container(
       padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
       decoration: BoxDecoration(
@@ -794,10 +810,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             borderRadius: BorderRadius.circular(14),
             border:
             Border.all(color: modeColor.withOpacity(0.4), width: 1),
-            boxShadow: [
-              BoxShadow(
-                  color: modeColor.withOpacity(0.12), blurRadius: 14)
-            ],
           ),
           child: Row(children: [
             const Icon(Icons.face_retouching_natural,
@@ -821,7 +833,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ),
                   ]),
             ),
-            // Auto badge
             Container(
               padding: const EdgeInsets.symmetric(
                   horizontal: 10, vertical: 4),
@@ -845,13 +856,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
           ]),
         ),
-
         const SizedBox(height: 10),
-
         Text(
           _isProcessing
               ? 'Recording attendance, please wait...'
-              : 'Attendance is recorded automatically via face recognition',
+              : 'Attendance recorded automatically via face recognition',
           style: TextStyle(
               color: Colors.white.withOpacity(0.3),
               fontSize: 11,

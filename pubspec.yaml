@@ -40,6 +40,7 @@ dependencies:
   path:
   intl:
   permission_handler:
+  image:
 
 
 dev_dependencies:
