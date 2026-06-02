@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:typed_data';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/status.dart' as ws_status;
@@ -38,8 +37,7 @@ class WebSocketService {
     print('🔌 WS: Attempting connection to $_wsUrl');
 
     try {
-      final uri = Uri.parse(_wsUrl);
-      _channel = WebSocketChannel.connect(uri);
+      _channel = WebSocketChannel.connect(Uri.parse(_wsUrl));
 
       await _channel!.ready.timeout(
         const Duration(seconds: 15),
@@ -82,18 +80,16 @@ class WebSocketService {
     }
   }
 
-  // ── Send Binary as Base64 string ───────────────────────────────────────────
-  // Server base64-encoded string expect karta hai, raw bytes nahi
+  // ── Send Binary frame (raw bytes) ─────────────────────────────────────────
   bool sendBinaryFrame(Uint8List jpegBytes) {
     if (_state != WsState.connected || _channel == null) {
       return false;
     }
     try {
-      final String base64Frame = base64Encode(jpegBytes);
-      _channel!.sink.add(base64Frame);
+      _channel!.sink.add(jpegBytes);
       return true;
     } catch (e) {
-      print('❌ WS SEND BASE64 ERROR: $e');
+      print('❌ WS SEND ERROR: $e');
       _handleError('Send failed: $e');
       return false;
     }

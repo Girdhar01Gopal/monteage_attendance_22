@@ -23,6 +23,7 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // ── Camera ──────────────────────────────────────────────────────────────────
   CameraController? _camCtrl;
+  bool _isInitializingCamera = false;
   bool _isCamReady = false;
   bool _camPermitted = false;
 
@@ -33,10 +34,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Color _wsStatusColor = Colors.red;
 
   // ── Frame streaming ──────────────────────────────────────────────────────────
-  Timer? _frameTimer;
-  bool _isSendingFrame = false;
   int _framesSent = 0;
   bool _isStreaming = false;
+  DateTime? _lastFrameTime;
 
   // ── Attendance processing ────────────────────────────────────────────────────
   bool _isProcessing = false;
@@ -69,7 +69,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _clockTimer?.cancel();
-    _frameTimer?.cancel();
     _resetTimer?.cancel();
     _camCtrl?.dispose();
     _ws.dispose();
@@ -126,9 +125,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // CAMERA
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Future<void> _initCamera() async {
+    if (_isInitializingCamera) return;
+    _isInitializingCamera = true;
     final status = await Permission.camera.request();
     if (!status.isGranted) {
       if (mounted) setState(() => _camPermitted = false);
+      _isInitializingCamera = false;
       return;
     }
     if (mounted) setState(() => _camPermitted = true);
@@ -142,8 +144,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     }
 
-    await _camCtrl?.dispose();
-    _camCtrl = CameraController(
+    final CameraController newController = CameraController(
       cam,
       ResolutionPreset.medium,
       enableAudio: false,
@@ -151,13 +152,33 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
 
     try {
-      await _camCtrl!.initialize();
+      await newController.initialize();
+
+      // If widget is no longer mounted, dispose the newly initialized controller.
+      if (!mounted) {
+        await newController.dispose();
+        return;
+      }
+
+      // Dispose the old controller (if any) and assign the new one.
+      final old = _camCtrl;
+      if (old != null) {
+        try {
+          await old.dispose();
+        } catch (_) {}
+      }
+      _camCtrl = newController;
       if (mounted) {
         setState(() => _isCamReady = true);
         if (_wsState == WsState.connected) _startStreaming();
       }
     } on CameraException catch (e) {
       debugPrint('Camera error: ${e.code} — ${e.description}');
+      try {
+        await newController.dispose();
+      } catch (_) {}
+    } finally {
+      _isInitializingCamera = false;
     }
   }
 
@@ -233,7 +254,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           status.contains('not_found') ||
           status.contains('unrecognized');
 
-      if (isNoFace) return; // keep streaming, nothing to record
+      if (isNoFace) {
+        debugPrint('👤 SERVER: No face / unknown — continuing stream');
+        return;
+      }
 
       // ── Trigger attendance if face was recognized ──────────────────────────
       final bool isRecognized = status.contains('recogni') ||
@@ -245,7 +269,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           employeeName.isNotEmpty;
 
       if (isRecognized) {
+        debugPrint('🎯 SERVER: Face recognized → employee: "$employeeName"');
         _onFaceRecognized(employeeName.isNotEmpty ? employeeName : 'Employee');
+      } else {
+        debugPrint('❓ SERVER: Unhandled response — name: "$employeeName" status: "$status"');
       }
     };
 
@@ -263,41 +290,44 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_wsState != WsState.connected) return;
     if (_isProcessing) return;
 
+    debugPrint('📹 STREAM: Starting image stream');
     setState(() {
       _isStreaming = true;
       _framesSent = 0;
     });
-
-    _frameTimer =
-        Timer.periodic(const Duration(milliseconds: 200), (_) {
-          _captureAndSendFrame();
-        });
+    _lastFrameTime = null;
+    _camCtrl!.startImageStream(_onCameraFrame);
   }
 
-  void _stopStreaming() {
-    _frameTimer?.cancel();
-    _frameTimer = null;
+  Future<void> _stopStreaming() async {
+    if (!_isStreaming) return;
+    debugPrint('🛑 STREAM: Stopping image stream');
     if (mounted) setState(() => _isStreaming = false);
+    try {
+      if (_camCtrl != null && _camCtrl!.value.isStreamingImages) {
+        await _camCtrl!.stopImageStream();
+      }
+    } catch (_) {}
   }
 
-  Future<void> _captureAndSendFrame() async {
-    if (_isSendingFrame) return;
-    if (!_isCamReady || _camCtrl == null) return;
-    if (_wsState != WsState.connected) return;
-    if (_isProcessing) return;
+  void _onCameraFrame(CameraImage image) {
+    if (_isProcessing || _wsState != WsState.connected) return;
 
-    _isSendingFrame = true;
-    try {
-      final XFile file = await _camCtrl!.takePicture();
-      final Uint8List bytes = await File(file.path).readAsBytes();
-      final sent = _ws.sendBinaryFrame(bytes);
-      if (sent && mounted) setState(() => _framesSent++);
-      await File(file.path).delete();
-    } catch (e) {
-      debugPrint('Frame capture error: $e');
-    } finally {
-      _isSendingFrame = false;
+    final now = DateTime.now();
+    if (_lastFrameTime != null &&
+        now.difference(_lastFrameTime!).inMilliseconds < 200) {
+      return;
     }
+    _lastFrameTime = now;
+
+    if (image.format.group != ImageFormatGroup.jpeg) {
+      debugPrint('⚠️ STREAM: Non-JPEG frame format: ${image.format.group} — skipping');
+      return;
+    }
+    final bytes = Uint8List.fromList(image.planes[0].bytes);
+    debugPrint('📤 STREAM: Sending frame ${_framesSent + 1} — ${bytes.length} bytes');
+    final sent = _ws.sendBinaryFrame(bytes);
+    if (sent && mounted) setState(() => _framesSent++);
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -308,7 +338,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (!_isCamReady || _camCtrl == null) return;
 
     setState(() => _isProcessing = true);
-    _stopStreaming();
+    await _stopStreaming();
 
     // ── Decide action: first time → checkin, then toggle ──────────────────────
     final action = _nextActionFor(employeeName);
@@ -316,6 +346,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final label = isCheckIn ? 'Check-In' : 'Check-Out';
     final Color snackColor =
     isCheckIn ? const Color(0xFF00C853) : const Color(0xFFFF6D00);
+
+    debugPrint('🧾 ATTENDANCE: $employeeName → $action');
 
     try {
       final XFile photo = await _camCtrl!.takePicture();
@@ -329,6 +361,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final savedPath = p.join(dir.path, fileName);
       await File(photo.path).copy(savedPath);
       await File(photo.path).delete();
+      debugPrint('📸 ATTENDANCE: Photo saved → $savedPath');
 
       // ── Mark this action for the employee so next scan toggles ──────────────
       _lastAction[employeeName.toLowerCase().trim()] = action;
@@ -339,6 +372,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         'employee': employeeName,
         'timestamp': now.toIso8601String(),
       }));
+      debugPrint('📡 ATTENDANCE: Notified server — $action for $employeeName at ${now.toIso8601String()}');
 
       _showSnack(
         icon: isCheckIn ? '✅' : '👋',
@@ -346,18 +380,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         subtitle: '$employeeName — $timeStr, $dateStr',
         color: snackColor,
       );
+      debugPrint('✅ ATTENDANCE: Snackbar shown for $employeeName ($label)');
 
       // Wait 2.5 s → resume for next employee
       _resetTimer?.cancel();
       _resetTimer = Timer(const Duration(milliseconds: 2500), () {
         if (mounted) {
           setState(() => _isProcessing = false);
+          debugPrint('▶️ ATTENDANCE: Processing done — resuming stream');
           // Only restart streaming if WS is still connected
           if (_wsState == WsState.connected) _startStreaming();
         }
       });
     } catch (e) {
-      debugPrint('Attendance error: $e');
+      debugPrint('❌ ATTENDANCE ERROR: $e');
       _showSnack(
         icon: '❌',
         title: 'Error',
@@ -510,14 +546,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 fontSize: 11,
                 fontWeight: FontWeight.w500)),
         const Spacer(),
-        if (_isStreaming)
-          Row(children: [
-            const Icon(Icons.sensors, color: Colors.greenAccent, size: 13),
-            const SizedBox(width: 4),
-            Text('Streaming · $_framesSent frames',
-                style: const TextStyle(
-                    color: Colors.greenAccent, fontSize: 11)),
-          ]),
+      
         if (!_isStreaming && _wsState == WsState.disconnected)
           GestureDetector(
             onTap: _ws.connect,
