@@ -1,10 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:intl/intl.dart';
 import 'package:path/path.dart' as p;
@@ -12,6 +13,49 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../services/websocket_service.dart';
+
+// Top-level function required by compute() — runs in background isolate
+Uint8List _convertYuvToJpegInIsolate(Map<String, dynamic> params) {
+  try {
+    final int width = params['width'] as int;
+    final int height = params['height'] as int;
+    final Uint8List yBytes = params['yBytes'] as Uint8List;
+    final Uint8List uBytes = params['uBytes'] as Uint8List;
+    final Uint8List vBytes = params['vBytes'] as Uint8List;
+    final int yBytesPerRow = params['yBytesPerRow'] as int;
+    final int uvBytesPerRow = params['uvBytesPerRow'] as int;
+    final int uvPixelStride = params['uvPixelStride'] as int;
+
+    final imgLib = img.Image(width: width, height: height);
+
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        final int yIndex = y * yBytesPerRow + x;
+        final int uvIndex = (y >> 1) * uvBytesPerRow + (x >> 1) * uvPixelStride;
+
+        if (yIndex >= yBytes.length ||
+            uvIndex >= uBytes.length ||
+            uvIndex >= vBytes.length) continue;
+
+        final int yVal = yBytes[yIndex] & 0xFF;
+        final int uVal = uBytes[uvIndex] & 0xFF;
+        final int vVal = vBytes[uvIndex] & 0xFF;
+
+        final int r = (yVal + 1.402 * (vVal - 128)).round().clamp(0, 255);
+        final int g = (yVal - 0.344136 * (uVal - 128) - 0.714136 * (vVal - 128))
+            .round()
+            .clamp(0, 255);
+        final int b = (yVal + 1.772 * (uVal - 128)).round().clamp(0, 255);
+
+        imgLib.setPixelRgb(x, y, r, g, b);
+      }
+    }
+
+    return Uint8List.fromList(img.encodeJpg(imgLib, quality: 55));
+  } catch (_) {
+    return Uint8List(0);
+  }
+}
 
 class HomeScreen extends StatefulWidget {
   final List<CameraDescription> cameras;
@@ -51,6 +95,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Lock to landscape for camera/attendance kiosk use
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
     _startClock();
     _initWebSocket();
     _initCamera();
@@ -59,6 +108,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     _clockTimer?.cancel();
     _resetTimer?.cancel();
     _camCtrl?.dispose();
@@ -108,7 +158,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final status = await Permission.camera.request();
     if (!status.isGranted) {
-      if (mounted) setState(() => _camPermitted = false);
+      if (mounted) { setState(() => _camPermitted = false); }
       _isInitializingCamera = false;
       return;
     }
@@ -202,7 +252,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         return;
       }
 
-      // ✅ FIX: full_name sabse pehle check karo (server yahi bhejta hai)
       final String employeeName = (data['full_name'] ??
           data['name'] ??
           data['employee'] ??
@@ -212,7 +261,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           .toString()
           .trim();
 
-      // ✅ FIX: action sabse pehle check karo (server yahi bhejta hai)
       final String status = (data['action'] ??
           data['status'] ??
           data['event'] ??
@@ -224,7 +272,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       debugPrint('Parsed — name: "$employeeName"  status: "$status"');
 
-      // No face / unknown ignore karo
       final bool isNoFace = status.contains('no_face') ||
           status.contains('unknown') ||
           status.contains('not_found') ||
@@ -236,7 +283,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         return;
       }
 
-      // Face recognized
       final bool isRecognized = status.contains('checkin') ||
           status.contains('checkout') ||
           status.contains('checked_in') ||
@@ -249,12 +295,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       if (isRecognized) {
         debugPrint('🎯 Face recognized → "$employeeName"  action: "$status"');
-
-        // ✅ Server jo action bheje wahi use karo (checkin/checkout)
         final String serverAction = status.contains('checked_out') || status.contains('checkout')
             ? 'checkout'
             : 'checkin';
-
         _onFaceRecognized(
           employeeName.isNotEmpty ? employeeName : 'Employee',
           serverAction: serverAction,
@@ -266,7 +309,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _ws.connect();
   }
 
-  // ── Frame Streaming ────────────────────────────────────────────────────────
+  // ── Frame Streaming (compute isolate — no UI lag) ──────────────────────────
   void _startStreaming() {
     if (_isStreaming) return;
     if (!_isCamReady || _camCtrl == null) return;
@@ -300,80 +343,36 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final now = DateTime.now();
     if (_lastFrameTime != null &&
-        now.difference(_lastFrameTime!).inMilliseconds < 200) {
+        now.difference(_lastFrameTime!).inMilliseconds < 250) {
       return;
     }
     _lastFrameTime = now;
     _isSendingFrame = true;
 
-    _convertAndSend(image).whenComplete(() => _isSendingFrame = false);
-  }
+    // Extract raw bytes before handing off — CameraImage can't cross isolate
+    final params = <String, dynamic>{
+      'width': image.width,
+      'height': image.height,
+      'yBytes': Uint8List.fromList(image.planes[0].bytes),
+      'uBytes': Uint8List.fromList(image.planes[1].bytes),
+      'vBytes': Uint8List.fromList(image.planes[2].bytes),
+      'yBytesPerRow': image.planes[0].bytesPerRow,
+      'uvBytesPerRow': image.planes[1].bytesPerRow,
+      'uvPixelStride': image.planes[1].bytesPerPixel ?? 1,
+    };
 
-  Future<void> _convertAndSend(CameraImage image) async {
-    try {
-      final Uint8List jpegBytes = await _yuvToJpeg(image);
-      if (jpegBytes.isEmpty) return;
-
-      debugPrint('📤 Frame ${_framesSent + 1} — ${jpegBytes.length} bytes');
-      final sent = _ws.sendBinaryFrame(jpegBytes);
-      if (sent && mounted) setState(() => _framesSent++);
-    } catch (e) {
-      debugPrint('❌ Frame convert error: $e');
-    }
-  }
-
-  Future<Uint8List> _yuvToJpeg(CameraImage image) async {
-    try {
-      final int width = image.width;
-      final int height = image.height;
-
-      final yPlane = image.planes[0];
-      final uPlane = image.planes[1];
-      final vPlane = image.planes[2];
-
-      final Uint8List yBytes = yPlane.bytes;
-      final Uint8List uBytes = uPlane.bytes;
-      final Uint8List vBytes = vPlane.bytes;
-
-      final int uvRowStride = uPlane.bytesPerRow;
-      final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
-
-      final imgLib = img.Image(width: width, height: height);
-
-      for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-          final int yIndex = y * yPlane.bytesPerRow + x;
-          final int uvIndex =
-              (y >> 1) * uvRowStride + (x >> 1) * uvPixelStride;
-
-          if (yIndex >= yBytes.length ||
-              uvIndex >= uBytes.length ||
-              uvIndex >= vBytes.length) continue;
-
-          final int yVal = yBytes[yIndex] & 0xFF;
-          final int uVal = uBytes[uvIndex] & 0xFF;
-          final int vVal = vBytes[uvIndex] & 0xFF;
-
-          int r = (yVal + 1.402 * (vVal - 128)).round().clamp(0, 255);
-          int g = (yVal - 0.344136 * (uVal - 128) - 0.714136 * (vVal - 128))
-              .round()
-              .clamp(0, 255);
-          int b = (yVal + 1.772 * (uVal - 128)).round().clamp(0, 255);
-
-          imgLib.setPixelRgb(x, y, r, g, b);
-        }
+    compute(_convertYuvToJpegInIsolate, params).then((jpeg) {
+      if (jpeg.isNotEmpty) {
+        debugPrint('📤 Frame ${_framesSent + 1} — ${jpeg.length} bytes');
+        final sent = _ws.sendBinaryFrame(jpeg);
+        if (sent && mounted) setState(() => _framesSent++);
       }
-
-      final jpeg = img.encodeJpg(imgLib, quality: 60);
-      return Uint8List.fromList(jpeg);
-    } catch (e) {
-      debugPrint('YUV→JPEG error: $e');
-      return Uint8List(0);
-    }
+    }).catchError((e) {
+      debugPrint('❌ Frame error: $e');
+    }).whenComplete(() => _isSendingFrame = false);
   }
 
   // ── Attendance ─────────────────────────────────────────────────────────────
-  // ✅ FIX: serverAction parameter add kiya — server jo bheje wahi use karo
   Future<void> _onFaceRecognized(String employeeName, {String? serverAction}) async {
     if (_isProcessing) return;
     if (!_isCamReady || _camCtrl == null) return;
@@ -382,7 +381,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _stopStreaming();
     await Future.delayed(const Duration(milliseconds: 300));
 
-    // Server ne action bheja to wahi use karo, warna toggle logic
     final action = serverAction ?? _nextActionFor(employeeName);
     final isCheckIn = action == 'checkin' || action == 'checked_in';
     final label = isCheckIn ? 'Check-In' : 'Check-Out';
@@ -459,9 +457,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           decoration: BoxDecoration(
             color: const Color(0xFF0D1B3E),
             borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: color.withOpacity(0.6), width: 1.5),
+            border: Border.all(color: color.withValues(alpha:0.6), width: 1.5),
             boxShadow: [
-              BoxShadow(color: color.withOpacity(0.25), blurRadius: 20)
+              BoxShadow(color: color.withValues(alpha:0.25), blurRadius: 20)
             ],
           ),
           child: Row(children: [
@@ -496,11 +494,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Scaffold(
       backgroundColor: const Color(0xFF080F22),
       body: SafeArea(
-        child: Column(children: [
-          _buildTopBar(),
-          _buildStatusBar(),
-          Expanded(child: _buildCameraArea()),
-          _buildBottomPanel(),
+        child: Row(children: [
+          // Left: Camera preview (wider)
+          Expanded(
+            flex: 3,
+            child: _buildCameraArea(),
+          ),
+          // Right: Info panel
+          Container(
+            width: 260,
+            decoration: const BoxDecoration(
+              color: Color(0xFF0D1B3E),
+              border: Border(left: BorderSide(color: Color(0xFF1A2E5A), width: 1)),
+            ),
+            child: Column(children: [
+              _buildTopBar(),
+              _buildStatusBar(),
+              Expanded(child: _buildSidePanel()),
+            ]),
+          ),
         ]),
       ),
     );
@@ -508,54 +520,52 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Widget _buildTopBar() {
     return Container(
-      padding: const EdgeInsets.fromLTRB(20, 14, 20, 14),
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
       decoration: const BoxDecoration(
-        color: Color(0xFF0D1B3E),
-        border:
-        Border(bottom: BorderSide(color: Color(0xFF1A2E5A), width: 1)),
+        border: Border(bottom: BorderSide(color: Color(0xFF1A2E5A), width: 1)),
       ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('MONTEAGE',
-                style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 20,
-                    fontWeight: FontWeight.w900,
-                    letterSpacing: 4)),
-            Text(_currentDate,
-                style: TextStyle(
-                    color: Colors.white.withOpacity(0.4),
-                    fontSize: 10,
-                    letterSpacing: 1)),
-          ]),
-          Container(
-            padding:
-            const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1565C0).withOpacity(0.2),
-              borderRadius: BorderRadius.circular(24),
-              border: Border.all(
-                  color: const Color(0xFF1E88E5).withOpacity(0.4), width: 1),
-            ),
-            child: Text(_currentTime,
-                style: const TextStyle(
-                    color: Color(0xFF42A5F5),
-                    fontSize: 15,
-                    fontWeight: FontWeight.bold,
-                    fontFamily: 'monospace')),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('MONTEAGE',
+            style: TextStyle(
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 4)),
+        const SizedBox(height: 4),
+        Text(_currentDate,
+            style: TextStyle(
+                color: Colors.white.withValues(alpha:0.4),
+                fontSize: 9,
+                letterSpacing: 0.8)),
+        const SizedBox(height: 8),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1565C0).withValues(alpha:0.2),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+                color: const Color(0xFF1E88E5).withValues(alpha:0.4), width: 1),
           ),
-        ],
-      ),
+          child: Text(_currentTime,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                  color: Color(0xFF42A5F5),
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  fontFamily: 'monospace')),
+        ),
+      ]),
     );
   }
 
   Widget _buildStatusBar() {
     return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-      color: const Color(0xFF0A1428),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: const BoxDecoration(
+        color: Color(0xFF0A1428),
+        border: Border(bottom: BorderSide(color: Color(0xFF1A2E5A), width: 1)),
+      ),
       child: Row(children: [
         Container(
           width: 8,
@@ -564,22 +574,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             shape: BoxShape.circle,
             color: _wsStatusColor,
             boxShadow: [
-              BoxShadow(
-                  color: _wsStatusColor.withOpacity(0.6), blurRadius: 6)
+              BoxShadow(color: _wsStatusColor.withValues(alpha:0.6), blurRadius: 6)
             ],
           ),
         ),
         const SizedBox(width: 6),
-        Text('Server: $_wsStatusText',
-            style: TextStyle(
-                color: _wsStatusColor,
-                fontSize: 11,
-                fontWeight: FontWeight.w500)),
-        const Spacer(),
-        Text('Frames: $_framesSent',
-            style:
-            const TextStyle(color: Colors.white24, fontSize: 10)),
-        const SizedBox(width: 12),
+        Expanded(
+          child: Text(_wsStatusText,
+              style: TextStyle(
+                  color: _wsStatusColor,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500)),
+        ),
         if (_wsState == WsState.disconnected || _wsState == WsState.error)
           GestureDetector(
             onTap: _ws.connect,
@@ -590,6 +596,106 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     fontWeight: FontWeight.w700)),
           ),
       ]),
+    );
+  }
+
+  Widget _buildSidePanel() {
+    const Color modeColor = Color(0xFF42A5F5);
+    return Padding(
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Mode card
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: modeColor.withValues(alpha:0.08),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: modeColor.withValues(alpha:0.35), width: 1),
+            ),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                const Icon(Icons.face_retouching_natural, color: modeColor, size: 20),
+                const SizedBox(width: 8),
+                const Text('Attendance',
+                    style: TextStyle(
+                        color: modeColor,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1)),
+                const Spacer(),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: Colors.greenAccent.withValues(alpha:0.12),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                        color: Colors.greenAccent.withValues(alpha:0.35), width: 1),
+                  ),
+                  child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.face_retouching_natural,
+                        color: Colors.greenAccent, size: 11),
+                    SizedBox(width: 3),
+                    Text('Auto',
+                        style: TextStyle(
+                            color: Colors.greenAccent,
+                            fontSize: 9,
+                            fontWeight: FontWeight.w700)),
+                  ]),
+                ),
+              ]),
+              const SizedBox(height: 8),
+              const Text(
+                'First scan = Check-In\nSecond scan = Check-Out',
+                style: TextStyle(color: Colors.white38, fontSize: 10, height: 1.5),
+              ),
+            ]),
+          ),
+          const SizedBox(height: 12),
+          // Frames counter
+          Row(children: [
+            const Icon(Icons.send_rounded, color: Colors.white24, size: 13),
+            const SizedBox(width: 6),
+            Text('Frames sent: $_framesSent',
+                style: const TextStyle(color: Colors.white24, fontSize: 10)),
+          ]),
+          const Spacer(),
+          // Status message
+          if (_isProcessing)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.amber.withValues(alpha:0.1),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: Colors.amber.withValues(alpha:0.4), width: 1),
+              ),
+              child: const Row(children: [
+                SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(color: Colors.amber, strokeWidth: 2),
+                ),
+                SizedBox(width: 10),
+                Expanded(
+                  child: Text('Recording attendance...',
+                      style: TextStyle(color: Colors.amber, fontSize: 11)),
+                ),
+              ]),
+            )
+          else
+            Text(
+              'Attendance recorded automatically via face recognition',
+              style: TextStyle(
+                  color: Colors.white.withValues(alpha:0.25),
+                  fontSize: 10,
+                  height: 1.5),
+            ),
+          const SizedBox(height: 8),
+        ],
+      ),
     );
   }
 
@@ -604,124 +710,117 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Stack(fit: StackFit.expand, children: [
       CameraPreview(_camCtrl!),
 
+      // Top gradient
       Positioned(
-        top: 0, left: 0, right: 0, height: 90,
+        top: 0, left: 0, right: 0, height: 80,
         child: Container(
           decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
-              colors: [
-                Colors.black.withOpacity(0.55),
-                Colors.transparent
-              ],
+              colors: [Colors.black.withValues(alpha:0.5), Colors.transparent],
             ),
           ),
         ),
       ),
 
+      // Bottom gradient
       Positioned(
-        bottom: 0, left: 0, right: 0, height: 80,
+        bottom: 0, left: 0, right: 0, height: 70,
         child: Container(
           decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.bottomCenter,
               end: Alignment.topCenter,
-              colors: [
-                Colors.black.withOpacity(0.45),
-                Colors.transparent
-              ],
+              colors: [Colors.black.withValues(alpha:0.4), Colors.transparent],
             ),
           ),
         ),
       ),
 
+      // Face oval guide
       Center(
         child: Container(
-          width: 230,
-          height: 290,
+          width: 200,
+          height: 250,
           decoration: BoxDecoration(
             border: Border.all(color: ovalColor, width: 2.5),
-            borderRadius: BorderRadius.circular(150),
+            borderRadius: BorderRadius.circular(130),
           ),
         ),
       ),
 
+      // Streaming glow ring
       if (_isStreaming && !_isProcessing)
         Center(
           child: Container(
-            width: 240,
-            height: 300,
+            width: 212,
+            height: 262,
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(156),
+              borderRadius: BorderRadius.circular(138),
               border: Border.all(
-                  color: Colors.greenAccent.withOpacity(0.2), width: 7),
+                  color: Colors.greenAccent.withValues(alpha:0.2), width: 7),
             ),
           ),
         ),
 
+      // Processing ring + spinner
       if (_isProcessing) ...[
         Center(
           child: Container(
-            width: 240,
-            height: 300,
+            width: 212,
+            height: 262,
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(156),
-              border: Border.all(
-                  color: Colors.amber.withOpacity(0.45), width: 7),
+              borderRadius: BorderRadius.circular(138),
+              border: Border.all(color: Colors.amber.withValues(alpha:0.45), width: 7),
             ),
           ),
         ),
         const Center(
           child: SizedBox(
-            width: 52,
-            height: 52,
-            child: CircularProgressIndicator(
-                color: Colors.amber, strokeWidth: 3),
+            width: 48,
+            height: 48,
+            child: CircularProgressIndicator(color: Colors.amber, strokeWidth: 3),
           ),
         ),
       ],
 
+      // Top hint label
       Positioned(
-        top: 18, left: 16, right: 16,
+        top: 14, left: 12, right: 12,
         child: Center(
           child: Container(
-            padding:
-            const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
             decoration: BoxDecoration(
-              color: Colors.black.withOpacity(0.65),
-              borderRadius: BorderRadius.circular(20),
+              color: Colors.black.withValues(alpha:0.6),
+              borderRadius: BorderRadius.circular(18),
             ),
             child: Text(
               _isProcessing
                   ? 'Processing — please wait...'
-                  : '📸  Look at camera to record attendance',
+                  : 'Look at camera to record attendance',
               style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w500),
+                  color: Colors.white, fontSize: 11, fontWeight: FontWeight.w500),
             ),
           ),
         ),
       ),
 
+      // Server message overlay
       if (_lastServerMsg.isNotEmpty)
         Positioned(
-          bottom: 12, left: 16, right: 16,
+          bottom: 10, left: 12, right: 12,
           child: Center(
             child: Container(
-              padding:
-              const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
               decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.55),
-                borderRadius: BorderRadius.circular(10),
+                color: Colors.black.withValues(alpha:0.5),
+                borderRadius: BorderRadius.circular(8),
               ),
               child: Text(
                 'Server: $_lastServerMsg',
-                style: TextStyle(
-                    color: Colors.white.withOpacity(0.55),
-                    fontSize: 10),
-                maxLines: 2,
+                style: TextStyle(color: Colors.white.withValues(alpha:0.5), fontSize: 9),
+                maxLines: 1,
                 overflow: TextOverflow.ellipsis,
               ),
             ),
@@ -734,22 +833,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(32),
-        child:
-        Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          Icon(Icons.no_photography_outlined,
-              size: 72, color: Colors.red.shade400),
-          const SizedBox(height: 20),
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Icon(Icons.no_photography_outlined, size: 64, color: Colors.red.shade400),
+          const SizedBox(height: 16),
           const Text('Camera Access Required',
               style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold)),
-          const SizedBox(height: 10),
+                  color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
           Text('Camera permission is required to record attendance.',
               textAlign: TextAlign.center,
-              style: TextStyle(
-                  color: Colors.white.withOpacity(0.55), fontSize: 13)),
-          const SizedBox(height: 28),
+              style: TextStyle(color: Colors.white.withValues(alpha:0.55), fontSize: 12)),
+          const SizedBox(height: 24),
           ElevatedButton.icon(
             onPressed: () async {
               await openAppSettings();
@@ -761,10 +855,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF1565C0),
               foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(
-                  horizontal: 24, vertical: 14),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14)),
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             ),
           ),
         ]),
@@ -774,99 +866,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Widget _buildLoadingView() {
     return const Center(
-      child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            CircularProgressIndicator(
-                color: Color(0xFF1E88E5), strokeWidth: 2.5),
-            SizedBox(height: 16),
-            Text('Initializing camera...',
-                style:
-                TextStyle(color: Colors.white54, fontSize: 13)),
-          ]),
-    );
-  }
-
-  Widget _buildBottomPanel() {
-    const Color modeColor = Color(0xFF42A5F5);
-    return Container(
-      padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
-      decoration: BoxDecoration(
-        color: const Color(0xFF0D1B3E),
-        boxShadow: [
-          BoxShadow(
-              color: Colors.black.withOpacity(0.6),
-              blurRadius: 24,
-              offset: const Offset(0, -6))
-        ],
-      ),
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Container(
-          width: double.infinity,
-          padding:
-          const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-          decoration: BoxDecoration(
-            color: modeColor.withOpacity(0.1),
-            borderRadius: BorderRadius.circular(14),
-            border:
-            Border.all(color: modeColor.withOpacity(0.4), width: 1),
-          ),
-          child: Row(children: [
-            const Icon(Icons.face_retouching_natural,
-                color: modeColor, size: 26),
-            const SizedBox(width: 14),
-            const Expanded(
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('Attendance',
-                        style: TextStyle(
-                            color: modeColor,
-                            fontSize: 16,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: 1)),
-                    SizedBox(height: 2),
-                    Text(
-                      'First scan = Check-In · Second scan = Check-Out',
-                      style: TextStyle(
-                          color: Colors.white38, fontSize: 11),
-                    ),
-                  ]),
-            ),
-            Container(
-              padding: const EdgeInsets.symmetric(
-                  horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(
-                color: Colors.greenAccent.withOpacity(0.12),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                    color: Colors.greenAccent.withOpacity(0.35),
-                    width: 1),
-              ),
-              child: const Row(children: [
-                Icon(Icons.face_retouching_natural,
-                    color: Colors.greenAccent, size: 13),
-                SizedBox(width: 4),
-                Text('Auto Detect',
-                    style: TextStyle(
-                        color: Colors.greenAccent,
-                        fontSize: 10,
-                        fontWeight: FontWeight.w700)),
-              ]),
-            ),
-          ]),
-        ),
-        const SizedBox(height: 10),
-        Text(
-          _isProcessing
-              ? 'Recording attendance, please wait...'
-              : 'Attendance recorded automatically via face recognition',
-          style: TextStyle(
-              color: Colors.white.withOpacity(0.3),
-              fontSize: 11,
-              letterSpacing: 0.3),
-          textAlign: TextAlign.center,
-        ),
+      child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+        CircularProgressIndicator(color: Color(0xFF1E88E5), strokeWidth: 2.5),
+        SizedBox(height: 14),
+        Text('Initializing camera...',
+            style: TextStyle(color: Colors.white54, fontSize: 12)),
       ]),
     );
   }
