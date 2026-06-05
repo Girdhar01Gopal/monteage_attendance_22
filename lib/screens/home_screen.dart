@@ -13,6 +13,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../services/websocket_service.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 // Top-level function required by compute() — runs in background isolate
 Uint8List _convertYuvToJpegInIsolate(Map<String, dynamic> params) {
@@ -91,11 +92,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String _currentTime = '';
   String _currentDate = '';
 
+  Timer? _autoRefreshTimer;
+
+  final AudioPlayer _audioPlayer = AudioPlayer();
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    // Lock to landscape for camera/attendance kiosk use
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.landscapeLeft,
       DeviceOrientation.landscapeRight,
@@ -103,6 +107,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _startClock();
     _initWebSocket();
     _initCamera();
+    _startAutoRefresh();
   }
 
   @override
@@ -111,8 +116,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     _clockTimer?.cancel();
     _resetTimer?.cancel();
+    _autoRefreshTimer?.cancel();
     _camCtrl?.dispose();
     _ws.dispose();
+    _audioPlayer.dispose();
     super.dispose();
   }
 
@@ -142,6 +149,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _currentDate = DateFormat('EEEE, dd MMMM yyyy').format(now);
       });
     }
+  }
+
+  // ── Auto Refresh ───────────────────────────────────────────────────────────
+  void _startAutoRefresh() {
+    _autoRefreshTimer?.cancel();
+    _autoRefreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!mounted) return;
+      if (_wsState == WsState.disconnected || _wsState == WsState.error) {
+        debugPrint('🔄 Auto-refresh: reconnecting WS');
+        _ws.connect();
+      }
+      if (_wsState == WsState.connected && _isCamReady && !_isProcessing && !_isStreaming) {
+        debugPrint('🔄 Auto-refresh: restarting stream');
+        _startStreaming();
+      }
+    });
   }
 
   String _nextActionFor(String employeeName) {
@@ -309,7 +332,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _ws.connect();
   }
 
-  // ── Frame Streaming (compute isolate — no UI lag) ──────────────────────────
+  // ── Frame Streaming ────────────────────────────────────────────────────────
   void _startStreaming() {
     if (_isStreaming) return;
     if (!_isCamReady || _camCtrl == null) return;
@@ -343,13 +366,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final now = DateTime.now();
     if (_lastFrameTime != null &&
-        now.difference(_lastFrameTime!).inMilliseconds < 250) {
+        now.difference(_lastFrameTime!).inMilliseconds < 80) {
       return;
     }
     _lastFrameTime = now;
     _isSendingFrame = true;
 
-    // Extract raw bytes before handing off — CameraImage can't cross isolate
     final params = <String, dynamic>{
       'width': image.width,
       'height': image.height,
@@ -373,6 +395,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   // ── Attendance ─────────────────────────────────────────────────────────────
+  // FIX 1: try/catch braces were mismatched — audio error catch was swallowing
+  // the entire attendance flow, leaving _isProcessing = true forever.
+  // Now audio error is handled independently; attendance logic always runs.
   Future<void> _onFaceRecognized(String employeeName, {String? serverAction}) async {
     if (_isProcessing) return;
     if (!_isCamReady || _camCtrl == null) return;
@@ -389,6 +414,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     debugPrint('🧾 ATTENDANCE: $employeeName → $action');
 
+    // Audio plays independently — failure must NOT block attendance recording
+    try {
+      await _audioPlayer.play(
+        AssetSource('sounds/checkin.mp3'),
+      );
+    } catch (e) {
+      debugPrint('🔇 Audio error (ignored): $e');
+    }
+
+    // Attendance recording — separate try/catch so it always executes
     try {
       final XFile photo = await _camCtrl!.takePicture();
       final now = DateTime.now();
@@ -451,16 +486,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         behavior: SnackBarBehavior.floating,
         backgroundColor: Colors.transparent,
         elevation: 0,
-        margin: const EdgeInsets.all(12),
+        margin: const EdgeInsets.fromLTRB(12, 48, 12, 0),
         content: Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
           decoration: BoxDecoration(
-            color: const Color(0xFF0D1B3E),
+            color: color,
             borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: color.withValues(alpha:0.6), width: 1.5),
-            boxShadow: [
-              BoxShadow(color: color.withValues(alpha:0.25), blurRadius: 20)
-            ],
           ),
           child: Row(children: [
             Text(icon, style: const TextStyle(fontSize: 26)),
@@ -470,15 +501,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(title,
-                      style: TextStyle(
-                          color: color,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w800)),
+                  Text(
+                    title,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w800),
+                  ),
                   const SizedBox(height: 2),
-                  Text(subtitle,
-                      style: const TextStyle(
-                          color: Colors.white70, fontSize: 12)),
+                  Text(
+                    subtitle,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.85),
+                        fontSize: 12),
+                  ),
                 ],
               ),
             ),
@@ -494,74 +532,104 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Scaffold(
       backgroundColor: const Color(0xFF080F22),
       body: SafeArea(
-        child: Row(children: [
-          // Left: Camera preview (wider)
-          Expanded(
-            flex: 3,
-            child: _buildCameraArea(),
-          ),
-          // Right: Info panel
-          Container(
-            width: 260,
-            decoration: const BoxDecoration(
-              color: Color(0xFF0D1B3E),
-              border: Border(left: BorderSide(color: Color(0xFF1A2E5A), width: 1)),
-            ),
-            child: Column(children: [
-              _buildTopBar(),
-              _buildStatusBar(),
-              Expanded(child: _buildSidePanel()),
-            ]),
-          ),
-        ]),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final double panelWidth = constraints.maxWidth < 480
+                ? 160.0
+                : constraints.maxWidth < 640
+                ? 200.0
+                : 260.0;
+            return Row(children: [
+              Expanded(
+                flex: 3,
+                child: _buildCameraArea(),
+              ),
+              SizedBox(
+                width: panelWidth,
+                child: Container(
+                  decoration: const BoxDecoration(
+                    color: Color(0xFF0D1B3E),
+                    border: Border(
+                        left: BorderSide(color: Color(0xFF1A2E5A), width: 1)),
+                  ),
+                  child: Column(children: [
+                    _buildTopBar(panelWidth),
+                    _buildStatusBar(),
+                    Expanded(child: _buildSidePanel()),
+                  ]),
+                ),
+              ),
+            ]);
+          },
+        ),
       ),
     );
   }
 
-  Widget _buildTopBar() {
+  Widget _buildTopBar(double panelWidth) {
     return Container(
-      padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
       decoration: const BoxDecoration(
         border: Border(bottom: BorderSide(color: Color(0xFF1A2E5A), width: 1)),
       ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Text('MONTEAGE',
-            style: TextStyle(
-                color: Colors.white,
-                fontSize: 18,
-                fontWeight: FontWeight.w900,
-                letterSpacing: 4)),
-        const SizedBox(height: 4),
-        Text(_currentDate,
-            style: TextStyle(
-                color: Colors.white.withValues(alpha:0.4),
-                fontSize: 9,
-                letterSpacing: 0.8)),
-        const SizedBox(height: 8),
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-          decoration: BoxDecoration(
-            color: const Color(0xFF1565C0).withValues(alpha:0.2),
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(
-                color: const Color(0xFF1E88E5).withValues(alpha:0.4), width: 1),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: const Text(
+              'MONTEAGE',
+              style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 4),
+            ),
           ),
-          child: Text(_currentTime,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                  color: Color(0xFF42A5F5),
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                  fontFamily: 'monospace')),
-        ),
-      ]),
+          const SizedBox(height: 4),
+          Text(
+            _currentDate,
+            overflow: TextOverflow.ellipsis,
+            maxLines: 1,
+            style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.4),
+                fontSize: 9,
+                letterSpacing: 0.8),
+          ),
+          const SizedBox(height: 8),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1565C0).withValues(alpha: 0.2),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                  color: const Color(0xFF1E88E5).withValues(alpha: 0.4),
+                  width: 1),
+            ),
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(
+                _currentTime,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                    color: Color(0xFF42A5F5),
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    fontFamily: 'monospace'),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
   Widget _buildStatusBar() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: const BoxDecoration(
         color: Color(0xFF0A1428),
         border: Border(bottom: BorderSide(color: Color(0xFF1A2E5A), width: 1)),
@@ -574,126 +642,161 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             shape: BoxShape.circle,
             color: _wsStatusColor,
             boxShadow: [
-              BoxShadow(color: _wsStatusColor.withValues(alpha:0.6), blurRadius: 6)
+              BoxShadow(
+                  color: _wsStatusColor.withValues(alpha: 0.6), blurRadius: 6)
             ],
           ),
         ),
         const SizedBox(width: 6),
         Expanded(
-          child: Text(_wsStatusText,
-              style: TextStyle(
-                  color: _wsStatusColor,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w500)),
+          child: Text(
+            _wsStatusText,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+                color: _wsStatusColor,
+                fontSize: 11,
+                fontWeight: FontWeight.w500),
+          ),
         ),
         if (_wsState == WsState.disconnected || _wsState == WsState.error)
           GestureDetector(
             onTap: _ws.connect,
-            child: const Text('Retry ↺',
-                style: TextStyle(
-                    color: Color(0xFF42A5F5),
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700)),
+            child: const Text(
+              'Retry ↺',
+              style: TextStyle(
+                  color: Color(0xFF42A5F5),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700),
+            ),
           ),
       ]),
     );
   }
 
+  // FIX 2: Removed bottom SizedBox(height: 8) and replaced with SizedBox(height: 4)
+  // to eliminate the 5px bottom overflow on the side panel.
   Widget _buildSidePanel() {
     const Color modeColor = Color(0xFF42A5F5);
     return Padding(
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 4), // FIX: bottom 4 instead of all(12)
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Mode card
           Container(
             width: double.infinity,
-            padding: const EdgeInsets.all(14),
+            padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
-              color: modeColor.withValues(alpha:0.08),
+              color: modeColor.withValues(alpha: 0.08),
               borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: modeColor.withValues(alpha:0.35), width: 1),
+              border:
+              Border.all(color: modeColor.withValues(alpha: 0.35), width: 1),
             ),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                const Icon(Icons.face_retouching_natural, color: modeColor, size: 20),
-                const SizedBox(width: 8),
-                const Text('Attendance',
-                    style: TextStyle(
-                        color: modeColor,
-                        fontSize: 14,
-                        fontWeight: FontWeight.w800,
-                        letterSpacing: 1)),
-                const Spacer(),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-                  decoration: BoxDecoration(
-                    color: Colors.greenAccent.withValues(alpha:0.12),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(
-                        color: Colors.greenAccent.withValues(alpha:0.35), width: 1),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(children: [
+                  const Icon(Icons.face_retouching_natural,
+                      color: modeColor, size: 18),
+                  const SizedBox(width: 6),
+                  const Flexible(
+                    child: Text(
+                      'Attendance',
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                          color: modeColor,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 1),
+                    ),
                   ),
-                  child: const Row(mainAxisSize: MainAxisSize.min, children: [
-                    Icon(Icons.face_retouching_natural,
-                        color: Colors.greenAccent, size: 11),
-                    SizedBox(width: 3),
-                    Text('Auto',
-                        style: TextStyle(
-                            color: Colors.greenAccent,
-                            fontSize: 9,
-                            fontWeight: FontWeight.w700)),
-                  ]),
+                  const Spacer(),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 6, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: Colors.greenAccent.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                          color: Colors.greenAccent.withValues(alpha: 0.35),
+                          width: 1),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.face_retouching_natural,
+                            color: Colors.greenAccent, size: 11),
+                        SizedBox(width: 3),
+                        Text('Auto',
+                            style: TextStyle(
+                                color: Colors.greenAccent,
+                                fontSize: 9,
+                                fontWeight: FontWeight.w700)),
+                      ],
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: 8),
+                const Text(
+                  'First scan = Check-In\nSecond scan = Check-Out',
+                  style: TextStyle(
+                      color: Colors.white38, fontSize: 10, height: 1.5),
                 ),
-              ]),
-              const SizedBox(height: 8),
-              const Text(
-                'First scan = Check-In\nSecond scan = Check-Out',
-                style: TextStyle(color: Colors.white38, fontSize: 10, height: 1.5),
-              ),
-            ]),
+              ],
+            ),
           ),
-          const SizedBox(height: 12),
-          // Frames counter
+          const SizedBox(height: 10),
           Row(children: [
             const Icon(Icons.send_rounded, color: Colors.white24, size: 13),
             const SizedBox(width: 6),
-            Text('Frames sent: $_framesSent',
-                style: const TextStyle(color: Colors.white24, fontSize: 10)),
+            Flexible(
+              child: Text(
+                'Frames sent: $_framesSent',
+                overflow: TextOverflow.ellipsis,
+                style:
+                const TextStyle(color: Colors.white24, fontSize: 10),
+              ),
+            ),
           ]),
           const Spacer(),
-          // Status message
           if (_isProcessing)
             Container(
               width: double.infinity,
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(10),
               decoration: BoxDecoration(
-                color: Colors.amber.withValues(alpha:0.1),
+                color: Colors.amber.withValues(alpha: 0.1),
                 borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: Colors.amber.withValues(alpha:0.4), width: 1),
+                border: Border.all(
+                    color: Colors.amber.withValues(alpha: 0.4), width: 1),
               ),
               child: const Row(children: [
                 SizedBox(
                   width: 14,
                   height: 14,
-                  child: CircularProgressIndicator(color: Colors.amber, strokeWidth: 2),
+                  child: CircularProgressIndicator(
+                      color: Colors.amber, strokeWidth: 2),
                 ),
                 SizedBox(width: 10),
                 Expanded(
-                  child: Text('Recording attendance...',
-                      style: TextStyle(color: Colors.amber, fontSize: 11)),
+                  child: Text(
+                    'Recording attendance...',
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: Colors.amber, fontSize: 11),
+                  ),
                 ),
               ]),
             )
           else
             Text(
               'Attendance recorded automatically via face recognition',
+              overflow: TextOverflow.ellipsis,
+              maxLines: 3,
               style: TextStyle(
-                  color: Colors.white.withValues(alpha:0.25),
+                  color: Colors.white.withValues(alpha: 0.25),
                   fontSize: 10,
                   height: 1.5),
             ),
-          const SizedBox(height: 8),
+          // FIX: was SizedBox(height: 8) which caused 5px overflow — reduced to 4
+          const SizedBox(height: 4),
         ],
       ),
     );
@@ -710,35 +813,44 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Stack(fit: StackFit.expand, children: [
       CameraPreview(_camCtrl!),
 
-      // Top gradient
       Positioned(
-        top: 0, left: 0, right: 0, height: 80,
+        top: 0,
+        left: 0,
+        right: 0,
+        height: 80,
         child: Container(
           decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
-              colors: [Colors.black.withValues(alpha:0.5), Colors.transparent],
+              colors: [
+                Colors.black.withValues(alpha: 0.5),
+                Colors.transparent
+              ],
             ),
           ),
         ),
       ),
 
-      // Bottom gradient
       Positioned(
-        bottom: 0, left: 0, right: 0, height: 70,
+        bottom: 0,
+        left: 0,
+        right: 0,
+        height: 70,
         child: Container(
           decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.bottomCenter,
               end: Alignment.topCenter,
-              colors: [Colors.black.withValues(alpha:0.4), Colors.transparent],
+              colors: [
+                Colors.black.withValues(alpha: 0.4),
+                Colors.transparent
+              ],
             ),
           ),
         ),
       ),
 
-      // Face oval guide
       Center(
         child: Container(
           width: 200,
@@ -750,7 +862,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ),
 
-      // Streaming glow ring
       if (_isStreaming && !_isProcessing)
         Center(
           child: Container(
@@ -759,12 +870,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(138),
               border: Border.all(
-                  color: Colors.greenAccent.withValues(alpha:0.2), width: 7),
+                  color: Colors.greenAccent.withValues(alpha: 0.2), width: 7),
             ),
           ),
         ),
 
-      // Processing ring + spinner
       if (_isProcessing) ...[
         Center(
           child: Container(
@@ -772,7 +882,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             height: 262,
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(138),
-              border: Border.all(color: Colors.amber.withValues(alpha:0.45), width: 7),
+              border: Border.all(
+                  color: Colors.amber.withValues(alpha: 0.45), width: 7),
             ),
           ),
         ),
@@ -780,48 +891,59 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           child: SizedBox(
             width: 48,
             height: 48,
-            child: CircularProgressIndicator(color: Colors.amber, strokeWidth: 3),
+            child:
+            CircularProgressIndicator(color: Colors.amber, strokeWidth: 3),
           ),
         ),
       ],
 
-      // Top hint label
       Positioned(
-        top: 14, left: 12, right: 12,
+        top: 14,
+        left: 12,
+        right: 12,
         child: Center(
           child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            padding:
+            const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
             decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha:0.6),
+              color: Colors.black.withValues(alpha: 0.6),
               borderRadius: BorderRadius.circular(18),
             ),
             child: Text(
               _isProcessing
                   ? 'Processing — please wait...'
                   : 'Look at camera to record attendance',
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
               style: const TextStyle(
-                  color: Colors.white, fontSize: 11, fontWeight: FontWeight.w500),
+                  color: Colors.white,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500),
             ),
           ),
         ),
       ),
 
-      // Server message overlay
       if (_lastServerMsg.isNotEmpty)
         Positioned(
-          bottom: 10, left: 12, right: 12,
+          bottom: 10,
+          left: 12,
+          right: 12,
           child: Center(
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 10, vertical: 4),
               decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha:0.5),
+                color: Colors.black.withValues(alpha: 0.5),
                 borderRadius: BorderRadius.circular(8),
               ),
               child: Text(
                 'Server: $_lastServerMsg',
-                style: TextStyle(color: Colors.white.withValues(alpha:0.5), fontSize: 9),
-                maxLines: 1,
                 overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.5),
+                    fontSize: 9),
+                maxLines: 1,
               ),
             ),
           ),
@@ -834,15 +956,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       child: Padding(
         padding: const EdgeInsets.all(32),
         child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          Icon(Icons.no_photography_outlined, size: 64, color: Colors.red.shade400),
+          Icon(Icons.no_photography_outlined,
+              size: 64, color: Colors.red.shade400),
           const SizedBox(height: 16),
-          const Text('Camera Access Required',
-              style: TextStyle(
-                  color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+          const Text(
+            'Camera Access Required',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.bold),
+          ),
           const SizedBox(height: 8),
-          Text('Camera permission is required to record attendance.',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.white.withValues(alpha:0.55), fontSize: 12)),
+          Text(
+            'Camera permission is required to record attendance.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.55), fontSize: 12),
+          ),
           const SizedBox(height: 24),
           ElevatedButton.icon(
             onPressed: () async {
@@ -855,8 +986,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF1565C0),
               foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 20, vertical: 12),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
             ),
           ),
         ]),
@@ -867,7 +1000,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget _buildLoadingView() {
     return const Center(
       child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-        CircularProgressIndicator(color: Color(0xFF1E88E5), strokeWidth: 2.5),
+        CircularProgressIndicator(
+            color: Color(0xFF1E88E5), strokeWidth: 2.5),
         SizedBox(height: 14),
         Text('Initializing camera...',
             style: TextStyle(color: Colors.white54, fontSize: 12)),
