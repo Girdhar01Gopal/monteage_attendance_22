@@ -416,8 +416,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     // Audio plays independently — failure must NOT block attendance recording
     try {
+      final soundFile = isCheckIn ? 'sounds/checked_in.mp3' : 'sounds/checked_out.mp3';
       await _audioPlayer.play(
-        AssetSource('sounds/checkin.mp3'),
+        AssetSource(soundFile),
       );
     } catch (e) {
       debugPrint('🔇 Audio error (ignored): $e');

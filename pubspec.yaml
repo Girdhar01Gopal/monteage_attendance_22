@@ -70,7 +70,8 @@ flutter:
   assets:
     - assets/images/
     - assets/images/
-    - assets/sounds/checkin.mp3
+    - assets/sounds/checked_in.mp3
+    - assets/sounds/checked_out.mp3
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
