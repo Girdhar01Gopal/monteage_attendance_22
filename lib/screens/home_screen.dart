@@ -14,6 +14,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../services/websocket_service.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 
 // Top-level function required by compute() — runs in background isolate
 Uint8List _convertYuvToJpegInIsolate(Map<String, dynamic> params) {
@@ -66,7 +67,8 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
+class _HomeScreenState extends State<HomeScreen>
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   CameraController? _camCtrl;
   bool _isInitializingCamera = false;
   bool _isCamReady = false;
@@ -84,8 +86,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   bool _isProcessing = false;
   Timer? _resetTimer;
+  int _warmupFrames = 0;
+
+  late AnimationController _scanPulseCtrl;
+  late Animation<double> _scanPulseAnim;
+  Timer? _scanDotTimer;
+  int _scanDotIndex = 0;
 
   final Map<String, String> _lastAction = {};
+  final Map<String, DateTime> _lastMarkedAt = {};
+  static const Duration _markCooldown = Duration(seconds: 30);
   String _lastServerMsg = '';
 
   Timer? _clockTimer;
@@ -94,7 +104,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Timer? _autoRefreshTimer;
 
+  bool _isSystemRunning = true;
+
   final AudioPlayer _audioPlayer = AudioPlayer();
+
+  List<ConnectivityResult> _connectivity = [];
+  StreamSubscription? _connectivitySub;
 
   @override
   void initState() {
@@ -104,6 +119,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       DeviceOrientation.landscapeLeft,
       DeviceOrientation.landscapeRight,
     ]);
+    _scanPulseCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    )..repeat(reverse: true);
+    _scanPulseAnim = CurvedAnimation(parent: _scanPulseCtrl, curve: Curves.easeInOut);
+    _initConnectivity();
     _startClock();
     _initWebSocket();
     _initCamera();
@@ -117,6 +138,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _clockTimer?.cancel();
     _resetTimer?.cancel();
     _autoRefreshTimer?.cancel();
+    _scanDotTimer?.cancel();
+    _scanPulseCtrl.dispose();
+    _connectivitySub?.cancel();
     _camCtrl?.dispose();
     _ws.dispose();
     _audioPlayer.dispose();
@@ -127,12 +151,38 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       if (!_isCamReady) _initCamera();
-      if (_isCamReady && _wsState == WsState.connected && !_isProcessing) {
+      if (_isCamReady && _wsState == WsState.connected && !_isProcessing && _isSystemRunning) {
         _startStreaming();
       }
     } else if (state == AppLifecycleState.paused) {
       _stopStreaming();
     }
+  }
+
+  // ── Connectivity ──────────────────────────────────────────────────────────
+  Future<void> _initConnectivity() async {
+    final results = await Connectivity().checkConnectivity();
+    if (mounted) setState(() => _connectivity = results);
+
+    _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
+      if (!mounted) return;
+      setState(() => _connectivity = results);
+      final hasNet = results.any((r) => r != ConnectivityResult.none);
+      if (hasNet && _wsState != WsState.connected && _wsState != WsState.connecting) {
+        _ws.connect();
+      }
+    });
+  }
+
+  bool get _hasInternet =>
+      _connectivity.any((r) => r != ConnectivityResult.none);
+
+  String get _connectivityLabel {
+    if (_connectivity.contains(ConnectivityResult.wifi)) return 'Wi-Fi';
+    if (_connectivity.contains(ConnectivityResult.mobile)) return 'Mobile Data';
+    if (_connectivity.contains(ConnectivityResult.ethernet)) return 'Ethernet';
+    if (_connectivity.isEmpty) return 'Checking...';
+    return 'No Internet';
   }
 
   // ── Clock ──────────────────────────────────────────────────────────────────
@@ -156,6 +206,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _autoRefreshTimer?.cancel();
     _autoRefreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (!mounted) return;
+      if (!_isSystemRunning) return;
       if (_wsState == WsState.disconnected || _wsState == WsState.error) {
         debugPrint('🔄 Auto-refresh: reconnecting WS');
         _ws.connect();
@@ -165,6 +216,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _startStreaming();
       }
     });
+  }
+
+  void _toggleSystem() {
+    if (_isSystemRunning) {
+      _resetTimer?.cancel();
+      setState(() => _isSystemRunning = false);
+      _stopStreaming();
+      setState(() {
+        _isProcessing = false;
+        _framesSent = 0;
+        _lastServerMsg = '';
+        _lastAction.clear();
+        _lastMarkedAt.clear();
+      });
+    } else {
+      setState(() => _isSystemRunning = true);
+      if (_wsState == WsState.connected && _isCamReady && !_isProcessing) {
+        _startStreaming();
+      }
+    }
   }
 
   String _nextActionFor(String employeeName) {
@@ -220,7 +291,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       if (mounted) {
         setState(() => _isCamReady = true);
-        if (_wsState == WsState.connected) _startStreaming();
+        if (_wsState == WsState.connected && _isSystemRunning) _startStreaming();
       }
     } on CameraException catch (e) {
       debugPrint('Camera error: ${e.code} — ${e.description}');
@@ -246,7 +317,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           case WsState.connected:
             _wsStatusText = 'Connected';
             _wsStatusColor = Colors.greenAccent;
-            if (_isCamReady && !_isProcessing) _startStreaming();
+            if (_isCamReady && !_isProcessing && _isSystemRunning) _startStreaming();
             break;
           case WsState.disconnected:
             _wsStatusText = 'Disconnected';
@@ -343,6 +414,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() {
       _isStreaming = true;
       _framesSent = 0;
+      _scanDotIndex = 0;
+    });
+    _warmupFrames = 0;
+    _scanDotTimer?.cancel();
+    _scanDotTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      if (mounted) setState(() => _scanDotIndex = (_scanDotIndex + 1) % 4);
     });
     _lastFrameTime = null;
     _isSendingFrame = false;
@@ -352,6 +429,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _stopStreaming() async {
     if (!_isStreaming) return;
     debugPrint('🛑 STREAM: Stopping');
+    _scanDotTimer?.cancel();
     if (mounted) setState(() => _isStreaming = false);
     try {
       if (_camCtrl != null && _camCtrl!.value.isStreamingImages) {
@@ -361,8 +439,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   void _onCameraFrame(CameraImage image) {
-    if (_isProcessing || _wsState != WsState.connected) return;
+    if (_isProcessing || _wsState != WsState.connected || !_isSystemRunning) return;
     if (_isSendingFrame) return;
+
+    // Skip first 3 frames — camera auto-exposure/focus hasn't stabilised yet
+    if (_warmupFrames < 3) {
+      _warmupFrames++;
+      return;
+    }
 
     final now = DateTime.now();
     if (_lastFrameTime != null &&
@@ -401,6 +485,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _onFaceRecognized(String employeeName, {String? serverAction}) async {
     if (_isProcessing) return;
     if (!_isCamReady || _camCtrl == null) return;
+    if (!_isSystemRunning) return;
+
+    final String markKey = employeeName.toLowerCase().trim();
+    final DateTime? lastMarked = _lastMarkedAt[markKey];
+    if (lastMarked != null && DateTime.now().difference(lastMarked) < _markCooldown) {
+      debugPrint('⏳ Skipping duplicate mark for "$employeeName" — still in cooldown');
+      return;
+    }
+    _lastMarkedAt[markKey] = DateTime.now();
 
     setState(() => _isProcessing = true);
     await _stopStreaming();
@@ -457,11 +550,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _resetTimer = Timer(const Duration(milliseconds: 2500), () {
         if (mounted) {
           setState(() => _isProcessing = false);
-          if (_wsState == WsState.connected) _startStreaming();
+          if (_wsState == WsState.connected && _isSystemRunning) _startStreaming();
         }
       });
     } catch (e) {
       debugPrint('❌ Attendance error: $e');
+      _lastMarkedAt.remove(markKey);
       _showSnack(
         icon: '❌',
         title: 'Error',
@@ -469,7 +563,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         color: Colors.red,
       );
       setState(() => _isProcessing = false);
-      if (_wsState == WsState.connected) _startStreaming();
+      if (_wsState == WsState.connected && _isSystemRunning) _startStreaming();
     }
   }
 
@@ -746,19 +840,100 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(height: 10),
-          Row(children: [
-            const Icon(Icons.send_rounded, color: Colors.white24, size: 13),
-            const SizedBox(width: 6),
-            Flexible(
-              child: Text(
-                'Frames sent: $_framesSent',
-                overflow: TextOverflow.ellipsis,
-                style:
-                const TextStyle(color: Colors.white24, fontSize: 10),
+          if (_isStreaming && !_isProcessing)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF00E5FF).withValues(alpha: 0.07),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                    color: const Color(0xFF00E5FF).withValues(alpha: 0.3),
+                    width: 1),
+              ),
+              child: Row(children: [
+                SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    color: const Color(0xFF00E5FF),
+                    strokeWidth: 1.8,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Scanning${'.' * ((_scanDotIndex % 3) + 1)}',
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        color: Color(0xFF00E5FF),
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600),
+                  ),
+                ),
+                Text(
+                  '$_framesSent fr',
+                  style: TextStyle(
+                      color: const Color(0xFF00E5FF).withValues(alpha: 0.5),
+                      fontSize: 9),
+                ),
+              ]),
+            )
+          else
+            Row(children: [
+              const Icon(Icons.send_rounded, color: Colors.white24, size: 13),
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(
+                  'Frames sent: $_framesSent',
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white24, fontSize: 10),
+                ),
+              ),
+            ]),
+          const Spacer(),
+          GestureDetector(
+            onTap: _toggleSystem,
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              margin: const EdgeInsets.only(bottom: 8),
+              decoration: BoxDecoration(
+                color: _isSystemRunning
+                    ? Colors.red.withValues(alpha: 0.15)
+                    : Colors.greenAccent.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: _isSystemRunning
+                      ? Colors.red.withValues(alpha: 0.5)
+                      : Colors.greenAccent.withValues(alpha: 0.45),
+                  width: 1,
+                ),
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    _isSystemRunning
+                        ? Icons.stop_circle_outlined
+                        : Icons.play_circle_outlined,
+                    color: _isSystemRunning ? Colors.redAccent : Colors.greenAccent,
+                    size: 16,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    _isSystemRunning ? 'Stop' : 'Start',
+                    style: TextStyle(
+                      color: _isSystemRunning ? Colors.redAccent : Colors.greenAccent,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                ],
               ),
             ),
-          ]),
-          const Spacer(),
+          ),
           if (_isProcessing)
             Container(
               width: double.infinity,
@@ -807,9 +982,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (!_camPermitted) return _buildPermissionView();
     if (!_isCamReady || _camCtrl == null) return _buildLoadingView();
 
-    final Color ovalColor = _isProcessing
-        ? Colors.amber
-        : (_isStreaming ? Colors.greenAccent : Colors.white38);
+    if (_wsState == WsState.disconnected || _wsState == WsState.error) {
+      return _buildOfflineView();
+    }
 
     return Stack(fit: StackFit.expand, children: [
       CameraPreview(_camCtrl!),
@@ -852,51 +1027,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ),
 
-      Center(
-        child: Container(
-          width: 200,
-          height: 250,
-          decoration: BoxDecoration(
-            border: Border.all(color: ovalColor, width: 2.5),
-            borderRadius: BorderRadius.circular(130),
-          ),
-        ),
-      ),
-
       if (_isStreaming && !_isProcessing)
-        Center(
-          child: Container(
-            width: 212,
-            height: 262,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(138),
-              border: Border.all(
-                  color: Colors.greenAccent.withValues(alpha: 0.2), width: 7),
+        AnimatedBuilder(
+          animation: _scanPulseAnim,
+          builder: (context, _) => CustomPaint(
+            painter: _ScanBracketsPainter(
+              opacity: 0.35 + _scanPulseAnim.value * 0.65,
             ),
+            child: const SizedBox.expand(),
           ),
         ),
 
-      if (_isProcessing) ...[
-        Center(
-          child: Container(
-            width: 212,
-            height: 262,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(138),
-              border: Border.all(
-                  color: Colors.amber.withValues(alpha: 0.45), width: 7),
-            ),
-          ),
-        ),
+      if (_isProcessing)
         const Center(
           child: SizedBox(
             width: 48,
             height: 48,
-            child:
-            CircularProgressIndicator(color: Colors.amber, strokeWidth: 3),
+            child: CircularProgressIndicator(color: Colors.amber, strokeWidth: 3),
           ),
         ),
-      ],
 
       Positioned(
         top: 14,
@@ -913,11 +1062,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             child: Text(
               _isProcessing
                   ? 'Processing — please wait...'
-                  : 'Look at camera to record attendance',
+                  : (_isStreaming
+                      ? 'Scanning${['.  ', '.. ', '...', '   '][_scanDotIndex]}'
+                      : (!_isSystemRunning
+                          ? 'System paused — tap Start to resume'
+                          : 'Look at camera to record attendance')),
               overflow: TextOverflow.ellipsis,
               maxLines: 1,
-              style: const TextStyle(
-                  color: Colors.white,
+              style: TextStyle(
+                  color: _isStreaming && !_isProcessing
+                      ? Colors.cyanAccent
+                      : Colors.white,
                   fontSize: 11,
                   fontWeight: FontWeight.w500),
             ),
@@ -950,6 +1105,151 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
         ),
     ]);
+  }
+
+  Widget _buildOfflineView() {
+    final bool isRetrying = _wsState == WsState.error;
+    final bool hasNet = _hasInternet;
+
+    return Container(
+      color: const Color(0xFF080F22),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          // network / server icon
+          Container(
+            width: 72,
+            height: 72,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: (hasNet ? Colors.orange : Colors.red).withValues(alpha: 0.12),
+              border: Border.all(
+                color: (hasNet ? Colors.orange : Colors.red).withValues(alpha: 0.4),
+                width: 1.5,
+              ),
+            ),
+            child: Icon(
+              hasNet ? Icons.cloud_off_rounded : Icons.wifi_off_rounded,
+              size: 36,
+              color: hasNet ? Colors.orange : Colors.redAccent,
+            ),
+          ),
+          const SizedBox(height: 20),
+
+          Text(
+            hasNet ? 'Server Unreachable' : 'No Internet Connection',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 18,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.5,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            hasNet
+                ? 'Network is available but the server\ncannot be reached right now.'
+                : 'Check your Wi-Fi or mobile data,\nthen the app will reconnect automatically.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.45),
+              fontSize: 12,
+              height: 1.6,
+            ),
+          ),
+          const SizedBox(height: 24),
+
+          // connectivity badge
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+            decoration: BoxDecoration(
+              color: (hasNet ? Colors.greenAccent : Colors.red)
+                  .withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: (hasNet ? Colors.greenAccent : Colors.red)
+                    .withValues(alpha: 0.35),
+                width: 1,
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  hasNet ? Icons.signal_wifi_4_bar_rounded : Icons.signal_wifi_off_rounded,
+                  size: 14,
+                  color: hasNet ? Colors.greenAccent : Colors.redAccent,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  _connectivityLabel,
+                  style: TextStyle(
+                    color: hasNet ? Colors.greenAccent : Colors.redAccent,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 20),
+
+          // retry state / button
+          if (isRetrying)
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                    color: Colors.amber,
+                    strokeWidth: 2,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  'Reconnecting to server...',
+                  style: TextStyle(
+                    color: Colors.amber.withValues(alpha: 0.8),
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            )
+          else
+            GestureDetector(
+              onTap: _ws.connect,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1565C0).withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: const Color(0xFF1E88E5).withValues(alpha: 0.5),
+                    width: 1,
+                  ),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.refresh_rounded, color: Color(0xFF42A5F5), size: 16),
+                    SizedBox(width: 8),
+                    Text(
+                      'Retry Connection',
+                      style: TextStyle(
+                        color: Color(0xFF42A5F5),
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
   }
 
   Widget _buildPermissionView() {
@@ -1009,4 +1309,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       ]),
     );
   }
+}
+
+class _ScanBracketsPainter extends CustomPainter {
+  final double opacity;
+  const _ScanBracketsPainter({required this.opacity});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = const Color(0xFF00E5FF).withValues(alpha: opacity)
+      ..strokeWidth = 2.5
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
+
+    const double m = 36.0;
+    const double len = 28.0;
+
+    // top-left
+    canvas.drawLine(Offset(m, m + len), Offset(m, m), paint);
+    canvas.drawLine(Offset(m, m), Offset(m + len, m), paint);
+    // top-right
+    canvas.drawLine(Offset(size.width - m - len, m), Offset(size.width - m, m), paint);
+    canvas.drawLine(Offset(size.width - m, m), Offset(size.width - m, m + len), paint);
+    // bottom-left
+    canvas.drawLine(Offset(m, size.height - m - len), Offset(m, size.height - m), paint);
+    canvas.drawLine(Offset(m, size.height - m), Offset(m + len, size.height - m), paint);
+    // bottom-right
+    canvas.drawLine(Offset(size.width - m - len, size.height - m), Offset(size.width - m, size.height - m), paint);
+    canvas.drawLine(Offset(size.width - m, size.height - m), Offset(size.width - m, size.height - m - len), paint);
+  }
+
+  @override
+  bool shouldRepaint(_ScanBracketsPainter old) => old.opacity != opacity;
 }

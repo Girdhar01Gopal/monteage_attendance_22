@@ -42,6 +42,7 @@ dependencies:
   permission_handler:
   image:
   audioplayers:
+  connectivity_plus: ^6.0.0
 
 
 dev_dependencies:
