@@ -773,9 +773,9 @@ class _HomeScreenState extends State<HomeScreen>
   Widget _buildSidePanel() {
     const Color modeColor = Color(0xFF42A5F5);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 4), // FIX: bottom 4 instead of all(12)
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+      child: ListView(
+        padding: EdgeInsets.zero,
         children: [
           Container(
             width: double.infinity,
@@ -830,7 +830,7 @@ class _HomeScreenState extends State<HomeScreen>
                     ),
                   ),
                 ]),
-                const SizedBox(height: 8),
+                const SizedBox(height: 20),
                 const Text(
                   'First scan = Check-In\nSecond scan = Check-Out',
                   style: TextStyle(
